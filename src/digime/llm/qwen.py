@@ -1,6 +1,5 @@
-class QwenClient:
+from digime.llm.ollama import OllamaClient
+
+
+class QwenClient(OllamaClient):
     """Adapter for local Qwen-compatible runtimes such as Ollama or llama.cpp."""
-
-    def generate(self, prompt: str) -> str:
-        raise NotImplementedError("Connect this to the selected local runtime.")
-

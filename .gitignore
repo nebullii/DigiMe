@@ -1,9 +1,12 @@
 .venv/
 __pycache__/
 *.pyc
+*.egg-info/
 .pytest_cache/
 .ruff_cache/
 .env
+slack-debug-*.log
+/digime/
 
 data/raw/*
 data/processed/*
@@ -13,4 +16,3 @@ data/processed/*
 *.sqlite
 *.sqlite3
 *.db
-
