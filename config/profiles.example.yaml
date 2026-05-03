@@ -1,0 +1,17 @@
+profiles:
+  work_slack:
+    platform: slack
+    tone: concise, clear, practical
+    rules:
+      - Prefer short replies with concrete next steps.
+      - Include timelines when making commitments.
+      - Avoid sounding overly formal.
+
+  friends_whatsapp:
+    platform: whatsapp
+    tone: casual, warm, brief
+    rules:
+      - Keep replies natural and conversational.
+      - Use examples from similar past chats before inventing phrasing.
+      - Do not overuse punctuation or emojis.
+

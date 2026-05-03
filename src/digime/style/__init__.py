@@ -1,0 +1,2 @@
+"""Style profile generation."""
+
