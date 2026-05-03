@@ -1,6 +1,6 @@
 # DigiMe
 
-DigiMe is a local-first communication proxy. It watches approved sources, summarizes recent context, drafts replies with a local model, and waits for human approval before sending.
+DigiMe is a local-first communication proxy. It watches approved sources, summarizes recent context, and replies with a local model.
 
 The current working path is Discord + Ollama:
 
@@ -9,8 +9,7 @@ Discord channel
   -> DigiMe local watcher
   -> SQLite message store
   -> Qwen via Ollama
-  -> terminal approval
-  -> approved Discord reply
+  -> autonomous Discord reply
 ```
 
 ## Current Status
@@ -21,16 +20,19 @@ Working:
 - one-off proxy drafting from copied text
 - Discord channel polling through a bot token
 - live Discord watcher that keeps the bot online
-- terminal approval before sending
+- autonomous Discord replies by default
+- optional terminal approval mode for testing
+- deterministic meeting-request handling before the LLM path
 - local SQLite storage for Slack and Discord messages
+- default personality: efficient software engineer, light puns, detailed when useful, honest about limits
 
 Not built yet:
 
-- desktop/menu-bar approval UI
 - browser extension capture for Slack/Discord/Teams/Gmail web
 - automatic style retrieval from prior replies
 - multi-channel Discord watchlist
 - Slack live watcher
+- Zoom meeting-link creation integration
 
 ## Architecture
 
@@ -47,14 +49,72 @@ Local inbox / memory
 Reply engine
   prompt builder, risk checks, local Ollama model
         |
-Human approval
-  terminal now, desktop UI later
+Autonomous reply policy
+  auto-send now, optional approval mode for testing
         |
 Output
-  approved Discord send now, clipboard/app-specific send later
+  Discord send now, clipboard/app-specific send later
 ```
 
 The model does not directly inspect apps. DigiMe captures controlled context, then passes only that context to the model.
+
+## Personality
+
+DigiMe currently replies as an efficient software engineer:
+
+- clear, practical, and human-like
+- detailed when details help
+- lightly playful with software puns when natural
+- honest about uncertainty and missing context
+- privacy-aware and unwilling to invent facts or pretend actions happened
+- defaults to Google Meet for meeting requests unless Zoom or another platform is specified
+- does not claim a meeting link was created until calendar/meeting integrations exist
+
+## Google Meet Setup
+
+DigiMe defaults to Google Meet for meeting requests. It creates real Meet links through Google Calendar API when OAuth is configured.
+
+Required Google setup:
+
+1. Create an OAuth client in Google Cloud Console.
+2. Enable Google Calendar API.
+3. Download the OAuth client JSON.
+4. Save it locally as:
+
+```text
+config/google-oauth-client.json
+```
+
+5. Confirm `.env`:
+
+```bash
+GOOGLE_CALENDAR_ID=primary
+GOOGLE_OAUTH_CLIENT_FILE=./config/google-oauth-client.json
+GOOGLE_OAUTH_TOKEN_FILE=./config/google-token.json
+DIGIME_TIMEZONE=America/New_York
+```
+
+6. Run OAuth:
+
+```bash
+digime google auth
+```
+
+Check status:
+
+```bash
+digime google status
+```
+
+Once configured, a Discord message like:
+
+```text
+Can you arrange a meeting on Monday 11 am?
+```
+
+will create a Google Calendar event with a Google Meet link and send that link to the channel.
+
+If Google OAuth is not configured, DigiMe will say setup is required instead of pretending it created a meeting.
 
 ## Repo Layout
 
@@ -174,11 +234,19 @@ The watcher:
 - listens to Discord Gateway events
 - also polls the channel as a fallback
 - stores new messages locally
+- skips messages it has already handled
+- routes meeting requests to Google Calendar before using the LLM
 - summarizes recent channel context
 - drafts replies with local Qwen
-- waits for terminal approval
+- auto-sends the `natural` draft by default
 
-Approval options:
+Run with terminal approval instead:
+
+```bash
+digime discord watch --poll-seconds 3 --approval
+```
+
+Approval mode options:
 
 ```text
 1, 2, 3  send one of the drafts
@@ -212,6 +280,6 @@ Slack live reply automation is intentionally deferred until the local proxy loop
 - Keep tokens in `.env`; never commit them.
 - Store messages locally.
 - Watch only explicitly configured channels.
-- Do not send without human approval.
-- Treat generated replies as drafts until approved.
+- Default Discord watch mode sends autonomously.
+- Use `--approval` while testing risky channels.
 - Use app APIs only where permissions are explicit.

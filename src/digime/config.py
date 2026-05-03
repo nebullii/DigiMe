@@ -18,6 +18,16 @@ class Settings(BaseSettings):
         None,
         validation_alias="DISCORD_DEFAULT_CHANNEL_ID",
     )
+    google_calendar_id: str = Field("primary", validation_alias="GOOGLE_CALENDAR_ID")
+    google_oauth_client_file: str = Field(
+        "./config/google-oauth-client.json",
+        validation_alias="GOOGLE_OAUTH_CLIENT_FILE",
+    )
+    google_oauth_token_file: str = Field(
+        "./config/google-token.json",
+        validation_alias="GOOGLE_OAUTH_TOKEN_FILE",
+    )
+    timezone: str = Field("America/New_York", validation_alias="DIGIME_TIMEZONE")
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

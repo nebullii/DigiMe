@@ -32,6 +32,7 @@ class ProxyDraftRequest:
     message: str
     platform: str = "unknown"
     profile: str = "default"
+    additional_context: str | None = None
 
 
 class ProxyReplyAgent:
@@ -43,6 +44,7 @@ class ProxyReplyAgent:
             message=request.message,
             platform=request.platform,
             profile=request.profile,
+            additional_context=request.additional_context,
         )
         raw_response = self.llm.generate(prompt)
         return parse_proxy_draft_response(raw_response)
@@ -63,4 +65,3 @@ def _extract_json_object(raw_response: str) -> str:
     if start == -1 or end == -1 or end <= start:
         raise ValueError("Model response did not contain a JSON object.")
     return text[start : end + 1]
-

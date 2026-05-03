@@ -12,6 +12,21 @@ def test_build_proxy_draft_prompt_contains_message() -> None:
     assert "Can you review this today?" in prompt
     assert "Platform: slack" in prompt
     assert "Style profile: work_slack" in prompt
+    assert "senior software engineer" in prompt
+    assert "Google Meet" in prompt
+    assert "Latest message to answer" in prompt
+
+
+def test_build_proxy_draft_prompt_includes_structured_context() -> None:
+    prompt = build_proxy_draft_prompt(
+        message="Can you review this today?",
+        platform="slack",
+        profile="work_slack",
+        additional_context="Conversation state:\n- Intent: question",
+    )
+
+    assert "Structured conversation context" in prompt
+    assert "Intent: question" in prompt
 
 
 def test_parse_proxy_draft_response_extracts_json() -> None:
@@ -36,4 +51,3 @@ def test_parse_proxy_draft_response_extracts_json() -> None:
     assert package.summary == "They are asking for a review today."
     assert package.risk_checks.makes_commitment is True
     assert package.drafts[0].text == "Yep, I can take a look later today."
-

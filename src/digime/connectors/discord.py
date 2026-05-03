@@ -21,6 +21,7 @@ class DiscordMessage:
     author_name: str
     content: str
     timestamp: str
+    is_bot: bool
     raw: dict[str, Any]
 
 
@@ -76,5 +77,6 @@ class DiscordConnector:
             author_name=author.get("global_name") or author.get("username") or "unknown",
             content=item.get("content") or "",
             timestamp=item.get("timestamp", ""),
+            is_bot=bool(author.get("bot", False)),
             raw=item,
         )

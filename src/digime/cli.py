@@ -1,8 +1,15 @@
 import typer
 
+from digime.agent.conversation import (
+    ConversationState,
+    analyze_conversation,
+    build_conversation_brief,
+    turns_from_records,
+)
 from digime.agent.proxy_reply import ProxyDraftRequest, ProxyReplyAgent
 from digime.connectors.discord import DiscordApiError, DiscordConnector
 from digime.connectors.discord_watch import DiscordWatchConfig, run_discord_watcher
+from digime.connectors.google_calendar import GoogleCalendarConnector, GoogleCalendarError
 from digime.connectors.slack import SlackApiError, SlackConnector
 from digime.config import settings
 from digime.llm.ollama import OllamaClient, OllamaError
@@ -11,8 +18,10 @@ from digime.memory.store import MessageStore
 app = typer.Typer(help="DigiMe local personal reply agent.")
 slack_app = typer.Typer(help="Slack DM ingestion commands.")
 discord_app = typer.Typer(help="Discord bot-token polling commands.")
+google_app = typer.Typer(help="Google Calendar / Meet commands.")
 app.add_typer(slack_app, name="slack")
 app.add_typer(discord_app, name="discord")
+app.add_typer(google_app, name="google")
 
 
 @app.command()
@@ -28,6 +37,10 @@ def doctor() -> None:
     typer.echo(f"slack_your_user_id: {settings.slack_your_user_id or ''}")
     typer.echo(f"discord_token_configured: {bool(settings.discord_bot_token)}")
     typer.echo(f"discord_default_channel_id: {settings.discord_default_channel_id or ''}")
+    typer.echo(f"google_calendar_id: {settings.google_calendar_id}")
+    typer.echo(f"google_oauth_client_file: {settings.google_oauth_client_file}")
+    typer.echo(f"google_oauth_token_file: {settings.google_oauth_token_file}")
+    typer.echo(f"timezone: {settings.timezone}")
 
 
 @app.command()
@@ -193,11 +206,11 @@ def discord_summarize(
     model: str | None = typer.Option(None, help="Override local Ollama model."),
 ) -> None:
     """Summarize recent stored Discord channel messages with local Ollama."""
-    context = _discord_context(channel_id, limit)
+    state = _discord_state(channel_id, limit)
     prompt = (
         "Summarize this Discord channel context for the human. "
         "Mention key topics, decisions, direct asks, and whether a reply seems needed.\n\n"
-        f"{context}"
+        f"{build_conversation_brief(state)}"
     )
     typer.echo(_ollama(model).generate(prompt))
 
@@ -213,16 +226,36 @@ def discord_draft_needed(
     model: str | None = typer.Option(None, help="Override local Ollama model."),
 ) -> None:
     """Draft a reply package for recent stored Discord context."""
-    context = _discord_context(channel_id, limit)
+    state = _discord_state(channel_id, limit)
     agent = ProxyReplyAgent(_ollama(model))
     package = agent.draft(
         ProxyDraftRequest(
-            message=context,
+            message=f"{state.latest_author_name}: {state.latest_text}",
             platform="discord",
             profile=profile,
+            additional_context=build_conversation_brief(state),
         )
     )
     _print_proxy_package(package)
+
+
+@discord_app.command("logs")
+def discord_logs(
+    channel_id: str | None = typer.Option(
+        None,
+        help="Discord channel ID. Defaults to DISCORD_DEFAULT_CHANNEL_ID.",
+    ),
+    limit: int = typer.Option(20, help="Messages to show."),
+) -> None:
+    """Show recent locally stored Discord messages."""
+    resolved_channel_id = _discord_channel_id(channel_id)
+    store = _store()
+    store.initialize()
+    for message in store.recent_discord_messages(resolved_channel_id, limit=limit):
+        content = message["content"] or "[empty]"
+        typer.echo(
+            f"{message['timestamp']} | {message['author_name']} | {message['id']} | {content}"
+        )
 
 
 @discord_app.command("send-approved")
@@ -253,8 +286,13 @@ def discord_watch(
     profile: str = typer.Option("discord", help="Style profile name."),
     context_limit: int = typer.Option(25, help="Stored messages to include in each draft."),
     poll_seconds: int = typer.Option(5, help="Polling fallback interval in seconds."),
+    approval: bool = typer.Option(
+        False,
+        "--approval",
+        help="Require terminal approval before sending. Default is autonomous auto-send.",
+    ),
 ) -> None:
-    """Run a live Discord watcher with terminal approval before sending."""
+    """Run a live Discord watcher that drafts and sends replies."""
     resolved_channel_id = _discord_channel_id(channel_id)
     if not settings.discord_bot_token:
         raise typer.BadParameter("Set DISCORD_BOT_TOKEN in .env.")
@@ -268,8 +306,37 @@ def discord_watch(
         database_url=settings.database_url,
         context_limit=context_limit,
         poll_seconds=poll_seconds,
+        auto_send=not approval,
+        timezone=settings.timezone,
+        google_calendar_id=settings.google_calendar_id,
+        google_oauth_client_file=settings.google_oauth_client_file,
+        google_oauth_token_file=settings.google_oauth_token_file,
     )
     run_discord_watcher(config=config, approval_fn=_terminal_approval)
+
+
+@google_app.command("status")
+def google_status() -> None:
+    """Show whether Google Calendar OAuth files are configured."""
+    connector = _google_calendar_connector()
+    typer.echo(f"calendar_id: {settings.google_calendar_id}")
+    typer.echo(f"oauth_client_file_exists: {connector.credentials_path.exists()}")
+    typer.echo(f"oauth_token_file_exists: {connector.token_path.exists()}")
+
+
+@google_app.command("auth")
+def google_auth() -> None:
+    """Run Google OAuth by creating a tiny test client and building credentials."""
+    connector = _google_calendar_connector()
+    if not connector.credentials_path.exists():
+        raise typer.BadParameter(
+            f"Google OAuth client file not found: {connector.credentials_path}"
+        )
+    try:
+        connector._service()
+    except GoogleCalendarError as error:
+        raise typer.BadParameter(str(error)) from error
+    typer.echo(f"authorized: {connector.token_path}")
 
 
 def _store() -> MessageStore:
@@ -301,20 +368,32 @@ def _discord_channel_id(channel_id: str | None) -> str:
     return resolved_channel_id
 
 
-def _discord_context(channel_id: str | None, limit: int) -> str:
+def _discord_state(channel_id: str | None, limit: int) -> ConversationState:
     resolved_channel_id = _discord_channel_id(channel_id)
     store = _store()
     store.initialize()
-    context = store.recent_discord_context(resolved_channel_id, limit=limit)
-    if not context:
+    messages = store.recent_discord_messages(resolved_channel_id, limit=limit)
+    if not messages:
         raise typer.BadParameter("No stored Discord messages found. Run digime discord sync first.")
-    return context
+    turns = list(reversed(turns_from_records(messages)))
+    latest_human = next((turn for turn in reversed(turns) if not turn.is_bot), None)
+    if latest_human is None:
+        raise typer.BadParameter("No human Discord messages found in the stored context.")
+    return analyze_conversation(turns, latest_message_id=latest_human.id, bot_names={"DigiMe"})
 
 
 def _ollama(model: str | None) -> OllamaClient:
     return OllamaClient(
         model=model or settings.llm_model,
         base_url=settings.llm_base_url,
+    )
+
+
+def _google_calendar_connector() -> GoogleCalendarConnector:
+    return GoogleCalendarConnector(
+        credentials_path=settings.google_oauth_client_file,
+        token_path=settings.google_oauth_token_file,
+        calendar_id=settings.google_calendar_id,
     )
 
 

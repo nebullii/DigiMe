@@ -67,10 +67,25 @@ class MessageStore:
                     author_name text not null,
                     content text not null,
                     timestamp text not null,
+                    is_bot integer not null default 0,
                     raw_json text not null,
                     synced_at text default current_timestamp
                 );
+
+                create table if not exists handled_messages (
+                    source text not null,
+                    message_id text not null,
+                    action text not null,
+                    created_at text default current_timestamp,
+                    primary key (source, message_id, action)
+                );
                 """
+            )
+            self._ensure_column(
+                connection,
+                table="discord_messages",
+                column="is_bot",
+                definition="integer not null default 0",
             )
 
     def upsert_slack_conversation(self, conversation: Any) -> None:
@@ -194,16 +209,18 @@ class MessageStore:
                     author_name,
                     content,
                     timestamp,
+                    is_bot,
                     raw_json,
                     synced_at
                 )
-                values (?, ?, ?, ?, ?, ?, ?, current_timestamp)
+                values (?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)
                 on conflict(id) do update set
                     channel_id = excluded.channel_id,
                     author_id = excluded.author_id,
                     author_name = excluded.author_name,
                     content = excluded.content,
                     timestamp = excluded.timestamp,
+                    is_bot = excluded.is_bot,
                     raw_json = excluded.raw_json,
                     synced_at = current_timestamp
                 """,
@@ -214,24 +231,32 @@ class MessageStore:
                     message.author_name,
                     message.content,
                     message.timestamp,
+                    int(getattr(message, "is_bot", False)),
                     json.dumps(message.raw),
                 ),
             )
             return connection.execute("select changes()").fetchone()[0] == 1
 
-    def recent_discord_context(self, channel_id: str, limit: int = 25) -> str:
+    def recent_discord_context(
+        self,
+        channel_id: str,
+        limit: int = 25,
+        upto_message_id: str | None = None,
+    ) -> str:
         with self.connect() as connection:
-            rows = connection.execute(
-                """
+            query = """
                 select author_name, content, timestamp
                 from discord_messages
                 where channel_id = ?
                   and content != ''
-                order by cast(id as integer) desc
-                limit ?
-                """,
-                (channel_id, limit),
-            ).fetchall()
+            """
+            params: list[Any] = [channel_id]
+            if upto_message_id is not None:
+                query += " and cast(id as integer) <= cast(? as integer)"
+                params.append(upto_message_id)
+            query += " order by cast(id as integer) desc limit ?"
+            params.append(limit)
+            rows = connection.execute(query, tuple(params)).fetchall()
 
         ordered_rows = list(reversed(rows))
         return "\n".join(
@@ -239,10 +264,86 @@ class MessageStore:
             for row in ordered_rows
         )
 
+    def recent_discord_messages(
+        self,
+        channel_id: str,
+        limit: int = 25,
+        upto_message_id: str | None = None,
+    ) -> list[dict[str, str]]:
+        with self.connect() as connection:
+            query = """
+                select id, author_id, author_name, content, timestamp, is_bot
+                from discord_messages
+                where channel_id = ?
+            """
+            params: list[Any] = [channel_id]
+            if upto_message_id is not None:
+                query += " and cast(id as integer) <= cast(? as integer)"
+                params.append(upto_message_id)
+            query += " order by cast(id as integer) desc limit ?"
+            params.append(limit)
+            rows = connection.execute(query, tuple(params)).fetchall()
+        return [
+            {
+                "id": str(row["id"]),
+                "author_id": str(row["author_id"]),
+                "author_name": str(row["author_name"]),
+                "content": str(row["content"]),
+                "timestamp": str(row["timestamp"]),
+                "is_bot": bool(row["is_bot"]),
+            }
+            for row in rows
+        ]
+
+    def has_handled_message(self, source: str, message_id: str, action: str) -> bool:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                select 1
+                from handled_messages
+                where source = ?
+                  and message_id = ?
+                  and action = ?
+                """,
+                (source, message_id, action),
+            ).fetchone()
+        return row is not None
+
+    def mark_message_handled(self, source: str, message_id: str, action: str) -> bool:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                insert or ignore into handled_messages (source, message_id, action)
+                values (?, ?, ?)
+                """,
+                (source, message_id, action),
+            )
+            return connection.execute("select changes()").fetchone()[0] == 1
+
     def counts(self) -> dict[str, int]:
-        tables = ["slack_conversations", "slack_messages", "discord_messages", "reply_examples"]
+        tables = [
+            "slack_conversations",
+            "slack_messages",
+            "discord_messages",
+            "handled_messages",
+            "reply_examples",
+        ]
         with self.connect() as connection:
             return {
                 table: int(connection.execute(f"select count(*) from {table}").fetchone()[0])
                 for table in tables
             }
+
+    def _ensure_column(
+        self,
+        connection: sqlite3.Connection,
+        table: str,
+        column: str,
+        definition: str,
+    ) -> None:
+        columns = {
+            str(row["name"])
+            for row in connection.execute(f"pragma table_info({table})").fetchall()
+        }
+        if column not in columns:
+            connection.execute(f"alter table {table} add column {column} {definition}")
