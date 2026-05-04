@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import dataclass
 from pathlib import Path
+import re
 from typing import Any
+
+from digime.agent.meeting import MeetingRequest
 
 
 def sqlite_path_from_url(database_url: str) -> Path:
@@ -78,6 +82,14 @@ class MessageStore:
                     action text not null,
                     created_at text default current_timestamp,
                     primary key (source, message_id, action)
+                );
+
+                create table if not exists meeting_state (
+                    channel_id text primary key,
+                    request_json text not null,
+                    status text not null,
+                    last_message_id text,
+                    updated_at text default current_timestamp
                 );
                 """
             )
@@ -183,6 +195,89 @@ class MessageStore:
                     if connection.execute("select changes()").fetchone()[0] == 1:
                         inserted += 1
         return inserted
+
+    def save_reply_example(
+        self,
+        *,
+        platform: str,
+        conversation_id: str,
+        incoming_context: str,
+        your_reply: str,
+        sent_at: str,
+        source_message_id: str,
+    ) -> bool:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                insert into reply_examples (
+                    platform,
+                    conversation_id,
+                    incoming_context,
+                    your_reply,
+                    sent_at,
+                    source_message_id
+                )
+                values (?, ?, ?, ?, ?, ?)
+                on conflict(source_message_id) do update set
+                    platform = excluded.platform,
+                    conversation_id = excluded.conversation_id,
+                    incoming_context = excluded.incoming_context,
+                    your_reply = excluded.your_reply,
+                    sent_at = excluded.sent_at
+                """,
+                (
+                    platform,
+                    conversation_id,
+                    incoming_context,
+                    your_reply,
+                    sent_at,
+                    source_message_id,
+                ),
+            )
+            return connection.execute("select changes()").fetchone()[0] == 1
+
+    def find_similar_reply_examples(
+        self,
+        *,
+        platform: str,
+        query_text: str,
+        conversation_id: str | None = None,
+        limit: int = 3,
+    ) -> list["ReplyExampleMatch"]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                select id, platform, conversation_id, incoming_context, your_reply, sent_at, source_message_id
+                from reply_examples
+                where platform = ?
+                order by created_at desc
+                limit 200
+                """,
+                (platform,),
+            ).fetchall()
+
+        query_tokens = _tokenize(query_text)
+        matches: list[ReplyExampleMatch] = []
+        for row in rows:
+            incoming_context = str(row["incoming_context"])
+            score = _overlap_score(query_tokens, _tokenize(incoming_context))
+            if conversation_id and str(row["conversation_id"]) == conversation_id:
+                score += 3
+            if score <= 0:
+                continue
+            matches.append(
+                ReplyExampleMatch(
+                    source_message_id=str(row["source_message_id"]),
+                    platform=str(row["platform"]),
+                    conversation_id=str(row["conversation_id"]),
+                    incoming_context=incoming_context,
+                    your_reply=str(row["your_reply"]),
+                    sent_at=str(row["sent_at"]),
+                    score=score,
+                )
+            )
+        matches.sort(key=lambda item: (-item.score, item.sent_at), reverse=False)
+        return matches[:limit]
 
     def latest_discord_message_id(self, channel_id: str) -> str | None:
         with self.connect() as connection:
@@ -320,12 +415,67 @@ class MessageStore:
             )
             return connection.execute("select changes()").fetchone()[0] == 1
 
+    def get_meeting_state(self, channel_id: str) -> MeetingStateRecord | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                select channel_id, request_json, status, last_message_id, updated_at
+                from meeting_state
+                where channel_id = ?
+                """,
+                (channel_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return MeetingStateRecord(
+            channel_id=str(row["channel_id"]),
+            request=MeetingRequest.from_dict(json.loads(str(row["request_json"]))),
+            status=str(row["status"]),
+            last_message_id=str(row["last_message_id"] or ""),
+            updated_at=str(row["updated_at"]),
+        )
+
+    def save_meeting_state(
+        self,
+        channel_id: str,
+        request: MeetingRequest,
+        status: str = "pending",
+        last_message_id: str | None = None,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                insert into meeting_state (channel_id, request_json, status, last_message_id, updated_at)
+                values (?, ?, ?, ?, current_timestamp)
+                on conflict(channel_id) do update set
+                    request_json = excluded.request_json,
+                    status = excluded.status,
+                    last_message_id = excluded.last_message_id,
+                    updated_at = current_timestamp
+                """,
+                (
+                    channel_id,
+                    json.dumps(request.to_dict()),
+                    status,
+                    last_message_id,
+                ),
+            )
+
+    def clear_meeting_state(self, channel_id: str) -> bool:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "delete from meeting_state where channel_id = ?",
+                (channel_id,),
+            )
+            return cursor.rowcount > 0
+
     def counts(self) -> dict[str, int]:
         tables = [
             "slack_conversations",
             "slack_messages",
             "discord_messages",
             "handled_messages",
+            "meeting_state",
             "reply_examples",
         ]
         with self.connect() as connection:
@@ -347,3 +497,37 @@ class MessageStore:
         }
         if column not in columns:
             connection.execute(f"alter table {table} add column {column} {definition}")
+
+
+@dataclass(frozen=True)
+class MeetingStateRecord:
+    channel_id: str
+    request: MeetingRequest
+    status: str
+    last_message_id: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class ReplyExampleMatch:
+    source_message_id: str
+    platform: str
+    conversation_id: str
+    incoming_context: str
+    your_reply: str
+    sent_at: str
+    score: int
+
+
+def _tokenize(text: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9']+", text.lower())
+        if len(token) >= 3
+    }
+
+
+def _overlap_score(left: set[str], right: set[str]) -> int:
+    if not left or not right:
+        return 0
+    return len(left & right)

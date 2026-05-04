@@ -6,10 +6,12 @@ from digime.agent.conversation import (
     build_conversation_brief,
     turns_from_records,
 )
+from digime.benchmark.replay import load_replay_cases, run_replay_benchmark
+from digime.connectors.calendar_registry import CalendarProviderConfig, build_calendar_provider
 from digime.agent.proxy_reply import ProxyDraftRequest, ProxyReplyAgent
 from digime.connectors.discord import DiscordApiError, DiscordConnector
 from digime.connectors.discord_watch import DiscordWatchConfig, run_discord_watcher
-from digime.connectors.google_calendar import GoogleCalendarConnector, GoogleCalendarError
+from digime.connectors.google_calendar import GoogleCalendarError
 from digime.connectors.slack import SlackApiError, SlackConnector
 from digime.config import settings
 from digime.llm.ollama import OllamaClient, OllamaError
@@ -19,9 +21,11 @@ app = typer.Typer(help="DigiMe local personal reply agent.")
 slack_app = typer.Typer(help="Slack DM ingestion commands.")
 discord_app = typer.Typer(help="Discord bot-token polling commands.")
 google_app = typer.Typer(help="Google Calendar / Meet commands.")
+benchmark_app = typer.Typer(help="Replay benchmark commands.")
 app.add_typer(slack_app, name="slack")
 app.add_typer(discord_app, name="discord")
 app.add_typer(google_app, name="google")
+app.add_typer(benchmark_app, name="benchmark")
 
 
 @app.command()
@@ -37,6 +41,8 @@ def doctor() -> None:
     typer.echo(f"slack_your_user_id: {settings.slack_your_user_id or ''}")
     typer.echo(f"discord_token_configured: {bool(settings.discord_bot_token)}")
     typer.echo(f"discord_default_channel_id: {settings.discord_default_channel_id or ''}")
+    typer.echo(f"discord_channel_ids: {','.join(settings.discord_channel_ids)}")
+    typer.echo(f"calendar_provider: {settings.calendar_provider}")
     typer.echo(f"google_calendar_id: {settings.google_calendar_id}")
     typer.echo(f"google_oauth_client_file: {settings.google_oauth_client_file}")
     typer.echo(f"google_oauth_token_file: {settings.google_oauth_token_file}")
@@ -226,7 +232,14 @@ def discord_draft_needed(
     model: str | None = typer.Option(None, help="Override local Ollama model."),
 ) -> None:
     """Draft a reply package for recent stored Discord context."""
-    state = _discord_state(channel_id, limit)
+    resolved_channel_id = _discord_channel_id(channel_id)
+    state = _discord_state(resolved_channel_id, limit)
+    retrieved_examples = _store().find_similar_reply_examples(
+        platform="discord",
+        conversation_id=resolved_channel_id,
+        query_text="\n".join(turn.content for turn in state.relevant_turns),
+        limit=3,
+    )
     agent = ProxyReplyAgent(_ollama(model))
     package = agent.draft(
         ProxyDraftRequest(
@@ -234,6 +247,7 @@ def discord_draft_needed(
             platform="discord",
             profile=profile,
             additional_context=build_conversation_brief(state),
+            retrieved_examples=_format_retrieved_examples(retrieved_examples),
         )
     )
     _print_proxy_package(package)
@@ -278,9 +292,10 @@ def discord_send_approved(
 
 @discord_app.command("watch")
 def discord_watch(
-    channel_id: str | None = typer.Option(
+    channel_id: list[str] | None = typer.Option(
         None,
-        help="Discord channel ID. Defaults to DISCORD_DEFAULT_CHANNEL_ID.",
+        "--channel-id",
+        help="Discord channel ID. Repeat the option for multiple channels. Defaults to DISCORD_CHANNEL_IDS or DISCORD_DEFAULT_CHANNEL_ID.",
     ),
     model: str | None = typer.Option(None, help="Override local Ollama model."),
     profile: str = typer.Option("discord", help="Style profile name."),
@@ -293,13 +308,13 @@ def discord_watch(
     ),
 ) -> None:
     """Run a live Discord watcher that drafts and sends replies."""
-    resolved_channel_id = _discord_channel_id(channel_id)
+    resolved_channel_ids = _discord_channel_ids(channel_id)
     if not settings.discord_bot_token:
         raise typer.BadParameter("Set DISCORD_BOT_TOKEN in .env.")
 
     config = DiscordWatchConfig(
         token=settings.discord_bot_token,
-        channel_ids={int(resolved_channel_id)},
+        channel_ids={int(item) for item in resolved_channel_ids},
         model=model or settings.llm_model,
         ollama_base_url=settings.llm_base_url,
         profile=profile,
@@ -308,6 +323,7 @@ def discord_watch(
         poll_seconds=poll_seconds,
         auto_send=not approval,
         timezone=settings.timezone,
+        calendar_provider=settings.calendar_provider,
         google_calendar_id=settings.google_calendar_id,
         google_oauth_client_file=settings.google_oauth_client_file,
         google_oauth_token_file=settings.google_oauth_token_file,
@@ -319,6 +335,7 @@ def discord_watch(
 def google_status() -> None:
     """Show whether Google Calendar OAuth files are configured."""
     connector = _google_calendar_connector()
+    typer.echo(f"provider: {settings.calendar_provider}")
     typer.echo(f"calendar_id: {settings.google_calendar_id}")
     typer.echo(f"oauth_client_file_exists: {connector.credentials_path.exists()}")
     typer.echo(f"oauth_token_file_exists: {connector.token_path.exists()}")
@@ -327,6 +344,10 @@ def google_status() -> None:
 @google_app.command("auth")
 def google_auth() -> None:
     """Run Google OAuth by creating a tiny test client and building credentials."""
+    if settings.calendar_provider != "google":
+        raise typer.BadParameter(
+            f"Google auth is only valid when DIGIME_CALENDAR_PROVIDER=google, got {settings.calendar_provider!r}."
+        )
     connector = _google_calendar_connector()
     if not connector.credentials_path.exists():
         raise typer.BadParameter(
@@ -337,6 +358,67 @@ def google_auth() -> None:
     except GoogleCalendarError as error:
         raise typer.BadParameter(str(error)) from error
     typer.echo(f"authorized: {connector.token_path}")
+
+
+@benchmark_app.command("replay")
+def benchmark_replay(
+    cases_path: str = typer.Argument(
+        "benchmarks/replay_cases.json",
+        help="Path to the replay benchmark JSON file.",
+    ),
+    with_model: bool = typer.Option(
+        False,
+        "--with-model",
+        help="Also run local model drafting on draft-reply cases and report latency.",
+    ),
+    model: str | None = typer.Option(None, help="Override local Ollama model for --with-model."),
+) -> None:
+    """Run the replay benchmark against DigiMe's current routing behavior."""
+    cases = load_replay_cases(cases_path)
+    agent = ProxyReplyAgent(_ollama(model)) if with_model else None
+    results = run_replay_benchmark(
+        cases,
+        timezone_name=settings.timezone,
+        with_model=with_model,
+        agent=agent,
+    )
+
+    passed = 0
+    model_runs = 0
+    model_failures = 0
+    total_model_latency_ms = 0.0
+    for result in results:
+        status = "PASS" if result.passed else "FAIL"
+        typer.echo(
+            f"[{status}] {result.case.name} "
+            f"(intent: {result.actual_intent}, behavior: {result.actual_behavior})"
+        )
+        if not result.passed:
+            typer.echo(
+                f"  expected intent={result.case.expected_intent}, "
+                f"behavior={result.case.expected_behavior}"
+            )
+        if result.model_latency_ms is not None:
+            model_runs += 1
+            total_model_latency_ms += result.model_latency_ms
+            if result.model_error:
+                model_failures += 1
+                typer.echo(f"  model error: {result.model_error}")
+            else:
+                typer.echo(f"  model latency: {result.model_latency_ms:.1f} ms")
+        if result.passed:
+            passed += 1
+
+    typer.echo("")
+    typer.echo(f"cases: {len(results)}")
+    typer.echo(f"passed: {passed}")
+    typer.echo(f"failed: {len(results) - passed}")
+    if model_runs:
+        typer.echo(f"model_runs: {model_runs}")
+        typer.echo(f"model_failures: {model_failures}")
+        typer.echo(f"avg_model_latency_ms: {total_model_latency_ms / model_runs:.1f}")
+    if passed != len(results):
+        raise typer.Exit(code=1)
 
 
 def _store() -> MessageStore:
@@ -368,6 +450,18 @@ def _discord_channel_id(channel_id: str | None) -> str:
     return resolved_channel_id
 
 
+def _discord_channel_ids(channel_ids: list[str] | None) -> list[str]:
+    if channel_ids:
+        resolved_channel_ids = [item for item in channel_ids if item]
+    else:
+        resolved_channel_ids = settings.discord_channel_ids
+    if not resolved_channel_ids:
+        raise typer.BadParameter(
+            "Pass one or more --channel-id values or set DISCORD_CHANNEL_IDS / DISCORD_DEFAULT_CHANNEL_ID in .env."
+        )
+    return resolved_channel_ids
+
+
 def _discord_state(channel_id: str | None, limit: int) -> ConversationState:
     resolved_channel_id = _discord_channel_id(channel_id)
     store = _store()
@@ -382,6 +476,17 @@ def _discord_state(channel_id: str | None, limit: int) -> ConversationState:
     return analyze_conversation(turns, latest_message_id=latest_human.id, bot_names={"DigiMe"})
 
 
+def _format_retrieved_examples(matches: list[object]) -> str | None:
+    if not matches:
+        return None
+    lines: list[str] = []
+    for index, match in enumerate(matches, start=1):
+        lines.append(f"Example {index}:")
+        lines.append(f"Incoming context: {match.incoming_context}")
+        lines.append(f"Approved reply: {match.your_reply}")
+    return "\n".join(lines)
+
+
 def _ollama(model: str | None) -> OllamaClient:
     return OllamaClient(
         model=model or settings.llm_model,
@@ -389,12 +494,16 @@ def _ollama(model: str | None) -> OllamaClient:
     )
 
 
-def _google_calendar_connector() -> GoogleCalendarConnector:
-    return GoogleCalendarConnector(
-        credentials_path=settings.google_oauth_client_file,
-        token_path=settings.google_oauth_token_file,
-        calendar_id=settings.google_calendar_id,
+def _google_calendar_connector():
+    provider = build_calendar_provider(
+        CalendarProviderConfig(
+            provider="google",
+            calendar_id=settings.google_calendar_id,
+            oauth_client_file=settings.google_oauth_client_file,
+            oauth_token_file=settings.google_oauth_token_file,
+        )
     )
+    return provider
 
 
 def _print_proxy_package(package: object) -> None:
@@ -414,8 +523,11 @@ def _print_proxy_package(package: object) -> None:
 
 def _terminal_approval(formatted_package: str) -> str | None:
     typer.echo(formatted_package)
+    drafts = _extract_numbered_drafts(formatted_package)
     typer.echo("Approve reply:")
-    typer.echo("- enter 1, 2, or 3 to send that draft")
+    if drafts:
+        available = ", ".join(str(index) for index in range(1, len(drafts) + 1))
+        typer.echo(f"- enter {available} to send that draft")
     typer.echo("- enter e to type your own reply")
     typer.echo("- press Enter to skip")
     choice = typer.prompt("Choice", default="", show_default=False).strip()
@@ -424,13 +536,7 @@ def _terminal_approval(formatted_package: str) -> str | None:
         typer.echo("Skipped.")
         return None
 
-    lines = formatted_package.splitlines()
-    drafts = [
-        line.split(". ", 1)[1]
-        for line in lines
-        if line[:2] in {"1.", "2.", "3."} and ". " in line
-    ]
-    if choice in {"1", "2", "3"}:
+    if choice.isdigit():
         index = int(choice) - 1
         if index < len(drafts):
             return drafts[index]
@@ -443,6 +549,18 @@ def _terminal_approval(formatted_package: str) -> str | None:
 
     typer.echo("Unknown choice. Skipped.")
     return None
+
+
+def _extract_numbered_drafts(formatted_package: str) -> list[str]:
+    drafts: list[str] = []
+    for line in formatted_package.splitlines():
+        stripped = line.strip()
+        if not stripped or ". " not in stripped:
+            continue
+        prefix, remainder = stripped.split(". ", 1)
+        if prefix.isdigit():
+            drafts.append(remainder)
+    return drafts
 
 
 if __name__ == "__main__":

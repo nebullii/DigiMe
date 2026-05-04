@@ -74,6 +74,46 @@ def test_analyze_conversation_detects_direct_weather_request() -> None:
     assert state.should_auto_send is True
 
 
+def test_analyze_conversation_detects_whats_up_as_greeting() -> None:
+    turns = [
+        ConversationTurn(
+            id="1",
+            author_id="u1",
+            author_name="Lilian",
+            content="What's up DigiMe?",
+            timestamp="2026-05-03T10:00:00+00:00",
+        ),
+    ]
+
+    state = analyze_conversation(turns, latest_message_id="1", bot_names={"DigiMe"})
+
+    assert state.intent == "greeting"
+    assert state.needs_reply is True
+    assert state.should_auto_send is True
+
+
+def test_analyze_conversation_detects_welcome_as_greeting() -> None:
+    turns = [
+        ConversationTurn(
+            id="1",
+            author_id="u1",
+            author_name="Lilian",
+            content="Welcome <@1500599346876645406>",
+            timestamp="2026-05-03T10:00:00+00:00",
+        ),
+    ]
+
+    state = analyze_conversation(
+        turns,
+        latest_message_id="1",
+        bot_user_id="1500599346876645406",
+        bot_names={"DigiMe"},
+    )
+
+    assert state.intent == "greeting"
+    assert state.needs_reply is True
+
+
 def test_build_conversation_brief_contains_routing_flags() -> None:
     turns = [
         ConversationTurn(

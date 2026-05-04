@@ -33,6 +33,7 @@ class ProxyDraftRequest:
     platform: str = "unknown"
     profile: str = "default"
     additional_context: str | None = None
+    retrieved_examples: str | None = None
 
 
 class ProxyReplyAgent:
@@ -45,6 +46,7 @@ class ProxyReplyAgent:
             platform=request.platform,
             profile=request.profile,
             additional_context=request.additional_context,
+            retrieved_examples=request.retrieved_examples,
         )
         raw_response = self.llm.generate(prompt)
         return parse_proxy_draft_response(raw_response)

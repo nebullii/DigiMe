@@ -68,11 +68,21 @@ DigiMe currently replies as an efficient software engineer:
 - honest about uncertainty and missing context
 - privacy-aware and unwilling to invent facts or pretend actions happened
 - defaults to Google Meet for meeting requests unless Zoom or another platform is specified
-- does not claim a meeting link was created until calendar/meeting integrations exist
+- only claims a meeting link was created when the calendar action layer actually created it
+
+## Calendar Provider Layer
+
+DigiMe routes meeting actions through a calendar provider layer. Google is the current implemented provider, and it creates real Google Meet links through Google Calendar API when OAuth is configured.
+
+Current provider config:
+
+```bash
+DIGIME_CALENDAR_PROVIDER=google
+```
+
+Future providers such as Outlook or CalDAV should plug into the same action layer without changing the Discord watcher.
 
 ## Google Meet Setup
-
-DigiMe defaults to Google Meet for meeting requests. It creates real Meet links through Google Calendar API when OAuth is configured.
 
 Required Google setup:
 
@@ -188,6 +198,7 @@ Set `.env`:
 ```bash
 DISCORD_BOT_TOKEN=...
 DISCORD_DEFAULT_CHANNEL_ID=...
+DISCORD_CHANNEL_IDS=123456789,987654321
 ```
 
 Get the channel ID from Discord:
@@ -228,6 +239,12 @@ Run the live watcher:
 digime discord watch --poll-seconds 3
 ```
 
+Or watch multiple channels with one process:
+
+```bash
+digime discord watch --channel-id 123456789 --channel-id 987654321
+```
+
 The watcher:
 
 - keeps the bot online
@@ -235,7 +252,8 @@ The watcher:
 - also polls the channel as a fallback
 - stores new messages locally
 - skips messages it has already handled
-- routes meeting requests to Google Calendar before using the LLM
+- persists pending meeting state so follow-up messages like time confirmations can complete an earlier request
+- routes meeting requests through the configured calendar provider before using the LLM
 - summarizes recent channel context
 - drafts replies with local Qwen
 - auto-sends the `natural` draft by default

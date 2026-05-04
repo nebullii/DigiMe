@@ -1,0 +1,142 @@
+[
+  {
+    "name": "direct_greeting",
+    "platform": "discord",
+    "turns": [
+      {
+        "id": "1",
+        "author_id": "u1",
+        "author_name": "Lilian",
+        "content": "Hey DigiMe"
+      }
+    ],
+    "expected_intent": "greeting",
+    "expected_behavior": "deterministic_reply"
+  },
+  {
+    "name": "channel_statement_skip",
+    "platform": "discord",
+    "turns": [
+      {
+        "id": "1",
+        "author_id": "u1",
+        "author_name": "Alex",
+        "content": "I pushed the latest draft."
+      }
+    ],
+    "expected_intent": "statement",
+    "expected_behavior": "skip"
+  },
+  {
+    "name": "direct_question_draft",
+    "platform": "discord",
+    "turns": [
+      {
+        "id": "1",
+        "author_id": "u1",
+        "author_name": "Lilian",
+        "content": "DigiMe, can you help me test this reply?"
+      }
+    ],
+    "expected_intent": "question",
+    "expected_behavior": "draft_reply"
+  },
+  {
+    "name": "weather_request",
+    "platform": "discord",
+    "turns": [
+      {
+        "id": "1",
+        "author_id": "u1",
+        "author_name": "Lilian",
+        "content": "DigiMe, can you check the weather in Boston?"
+      }
+    ],
+    "expected_intent": "weather_request",
+    "expected_behavior": "deterministic_reply"
+  },
+  {
+    "name": "meeting_request_missing_time",
+    "platform": "discord",
+    "turns": [
+      {
+        "id": "1",
+        "author_id": "u1",
+        "author_name": "Siddharth",
+        "content": "DigiMe, can you set up a meeting on Tuesday?"
+      }
+    ],
+    "expected_intent": "meeting_request",
+    "expected_behavior": "meeting_clarify"
+  },
+  {
+    "name": "meeting_request_complete",
+    "platform": "discord",
+    "turns": [
+      {
+        "id": "1",
+        "author_id": "u1",
+        "author_name": "Siddharth",
+        "content": "DigiMe, can you set up a meeting on Tuesday at 3 pm?"
+      }
+    ],
+    "expected_intent": "meeting_request",
+    "expected_behavior": "meeting_create"
+  },
+  {
+    "name": "meeting_follow_up_with_time",
+    "platform": "discord",
+    "turns": [
+      {
+        "id": "1",
+        "author_id": "u1",
+        "author_name": "Siddharth",
+        "content": "DigiMe, can you set up a meeting on Tuesday?"
+      },
+      {
+        "id": "2",
+        "author_id": "u2",
+        "author_name": "Nevi",
+        "content": "3 pm works for me"
+      }
+    ],
+    "latest_message_id": "2",
+    "expected_intent": "meeting_follow_up",
+    "expected_behavior": "meeting_create"
+  },
+  {
+    "name": "unsupported_zoom_request",
+    "platform": "discord",
+    "turns": [
+      {
+        "id": "1",
+        "author_id": "u1",
+        "author_name": "Siddharth",
+        "content": "DigiMe, can you set up a Zoom meeting Tuesday at 2 pm?"
+      }
+    ],
+    "expected_intent": "meeting_request",
+    "expected_behavior": "unsupported_meeting_platform"
+  },
+  {
+    "name": "short_acknowledgement_skip",
+    "platform": "discord",
+    "turns": [
+      {
+        "id": "1",
+        "author_id": "u1",
+        "author_name": "Alex",
+        "content": "I deployed the patch."
+      },
+      {
+        "id": "2",
+        "author_id": "u2",
+        "author_name": "Jamie",
+        "content": "ok"
+      }
+    ],
+    "latest_message_id": "2",
+    "expected_intent": "acknowledgement",
+    "expected_behavior": "skip"
+  }
+]

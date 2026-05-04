@@ -35,7 +35,16 @@ REQUEST_WORDS = {
     "share",
     "join",
 }
-GREETING_WORDS = {"hi", "hello", "hey", "yo"}
+GREETING_WORDS = {"hi", "hello", "hey", "yo", "welcome"}
+GREETING_PHRASES = {
+    "what's up",
+    "whats up",
+    "good morning",
+    "good afternoon",
+    "good evening",
+    "how's it going",
+    "hows it going",
+}
 THANKS_WORDS = {"thanks", "thank you", "thx", "ty"}
 ACK_WORDS = {
     "ok",
@@ -328,7 +337,12 @@ def _looks_like_request(text: str) -> bool:
 
 
 def _looks_like_greeting(text: str) -> bool:
-    return len(text.split()) <= 8 and any(text.startswith(word) for word in GREETING_WORDS)
+    compact = " ".join(text.split())
+    if len(compact.split()) > 10:
+        return False
+    if any(compact.startswith(word) for word in GREETING_WORDS):
+        return True
+    return any(compact.startswith(phrase) for phrase in GREETING_PHRASES)
 
 
 def _looks_like_thanks(text: str) -> bool:

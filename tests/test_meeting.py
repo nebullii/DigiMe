@@ -1,4 +1,8 @@
-from digime.agent.meeting import looks_like_meeting_request, parse_meeting_request
+from digime.agent.meeting import (
+    looks_like_meeting_request,
+    merge_meeting_requests,
+    parse_meeting_request,
+)
 
 
 def test_looks_like_meeting_request() -> None:
@@ -22,3 +26,13 @@ def test_parse_zoom_request_respects_specified_platform() -> None:
 
     assert request.platform == "zoom"
 
+
+def test_merge_meeting_requests_accumulates_partial_scheduling_details() -> None:
+    base = parse_meeting_request("Can you set up a meeting Tuesday?", "America/New_York")
+    update = parse_meeting_request("2pm works for me", "America/New_York")
+
+    merged = merge_meeting_requests(base, update, "America/New_York")
+
+    assert merged.start is not None
+    assert merged.start.hour == 14
+    assert merged.weekday == base.weekday

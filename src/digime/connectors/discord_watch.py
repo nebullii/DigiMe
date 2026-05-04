@@ -12,12 +12,13 @@ from digime.agent.conversation import (
     build_conversation_brief,
     turns_from_records,
 )
-from digime.agent.meeting import parse_meeting_request
+from digime.agent.meeting import merge_meeting_requests, parse_meeting_request
 from digime.agent.proxy_reply import ProxyDraftRequest, ProxyReplyAgent
+from digime.connectors.calendar_provider import CalendarProviderError
+from digime.connectors.calendar_registry import CalendarProviderConfig, build_calendar_provider
 from digime.connectors.discord import DiscordMessage
-from digime.connectors.google_calendar import GoogleCalendarConnector, GoogleCalendarError
 from digime.llm.ollama import OllamaClient
-from digime.memory.store import MessageStore
+from digime.memory.store import MessageStore, ReplyExampleMatch
 
 
 ApprovalFn = Callable[[str], str | None]
@@ -35,6 +36,7 @@ class DiscordWatchConfig:
     poll_seconds: int = 5
     auto_send: bool = True
     timezone: str = "America/New_York"
+    calendar_provider: str = "google"
     google_calendar_id: str = "primary"
     google_oauth_client_file: str = "./config/google-oauth-client.json"
     google_oauth_token_file: str = "./config/google-token.json"
@@ -51,10 +53,13 @@ class DigiMeDiscordClient(discord.Client):
         self.agent = ProxyReplyAgent(
             OllamaClient(model=config.model, base_url=config.ollama_base_url)
         )
-        self.calendar = GoogleCalendarConnector(
-            credentials_path=config.google_oauth_client_file,
-            token_path=config.google_oauth_token_file,
-            calendar_id=config.google_calendar_id,
+        self.calendar = build_calendar_provider(
+            CalendarProviderConfig(
+                provider=config.calendar_provider,
+                calendar_id=config.google_calendar_id,
+                oauth_client_file=config.google_oauth_client_file,
+                oauth_token_file=config.google_oauth_token_file,
+            )
         )
         self.latest_seen_ids: dict[int, int] = {}
 
@@ -120,12 +125,18 @@ class DigiMeDiscordClient(discord.Client):
             )
             return
 
-        meeting_reply = await asyncio.to_thread(self._handle_meeting_request, state)
+        meeting_reply = await asyncio.to_thread(
+            self._handle_meeting_request,
+            state,
+            str(message.channel.id),
+            str(message.id),
+        )
         if meeting_reply is not None:
             handled = await self._send_proposed_reply(
                 message=message,
                 proposed_reply=meeting_reply,
                 reason="meeting action",
+                state=state,
             )
             if handled:
                 self.store.mark_message_handled("discord", str(message.id), "reply")
@@ -137,6 +148,7 @@ class DigiMeDiscordClient(discord.Client):
                 message=message,
                 proposed_reply=action_reply,
                 reason=f"{state.intent} action",
+                state=state,
             )
             if handled:
                 self.store.mark_message_handled("discord", str(message.id), "reply")
@@ -149,6 +161,7 @@ class DigiMeDiscordClient(discord.Client):
                 platform="discord",
                 profile=self.config.profile,
                 additional_context=build_conversation_brief(state),
+                retrieved_examples=self._retrieved_examples_block(state, str(message.channel.id)),
             ),
         )
 
@@ -164,7 +177,7 @@ class DigiMeDiscordClient(discord.Client):
         if self.config.auto_send and state.should_auto_send and not package.risk_checks.sensitive:
             reply = _select_auto_reply(package.drafts)
             print(f"Auto-sending:\n{reply}\n")
-            await self._send_and_store(message.channel, reply)
+            await self._send_and_store(message.channel, reply, state=state, source_message_id=str(message.id))
             self.store.mark_message_handled("discord", str(message.id), "reply")
             return
         if self.config.auto_send:
@@ -177,15 +190,34 @@ class DigiMeDiscordClient(discord.Client):
 
         approved_reply = await asyncio.to_thread(self.approval_fn, formatted_package)
         if approved_reply:
-            await self._send_and_store(message.channel, approved_reply)
+            await self._send_and_store(
+                message.channel,
+                approved_reply,
+                state=state,
+                source_message_id=str(message.id),
+            )
             self.store.mark_message_handled("discord", str(message.id), "reply")
 
-    def _handle_meeting_request(self, state: ConversationState) -> str | None:
+    def _handle_meeting_request(
+        self,
+        state: ConversationState,
+        channel_id: str,
+        message_id: str,
+    ) -> str | None:
         if state.intent not in {"meeting_request", "meeting_follow_up"}:
             return None
 
-        meeting_context = "\n".join(turn.content for turn in state.relevant_turns)
-        request = parse_meeting_request(meeting_context, self.config.timezone)
+        pending_state = self.store.get_meeting_state(channel_id)
+        parse_text = state.latest_text if pending_state is not None else "\n".join(
+            turn.content for turn in state.relevant_turns
+        )
+        request = parse_meeting_request(parse_text, self.config.timezone)
+        if pending_state is not None:
+            request = merge_meeting_requests(
+                pending_state.request,
+                request,
+                self.config.timezone,
+            )
         if request.title == "DigiMe meeting":
             request = type(request)(
                 platform=request.platform,
@@ -193,34 +225,48 @@ class DigiMeDiscordClient(discord.Client):
                 duration_minutes=request.duration_minutes,
                 title=f"Discord sync with {state.latest_author_name}",
                 attendees=request.attendees,
-                description=meeting_context,
+                description=request.description,
                 missing_fields=request.missing_fields,
+                weekday=request.weekday,
+                relative_day=request.relative_day,
+                time_hour=request.time_hour,
+                time_minute=request.time_minute,
+                duration_explicit=request.duration_explicit,
             )
-        if request.platform != "google_meet":
+        self.store.save_meeting_state(
+            channel_id=channel_id,
+            request=request,
+            status="pending",
+            last_message_id=message_id,
+        )
+        if not self.calendar.supports_meeting_platform(request.platform):
             return (
-                "I saw the meeting request, but Zoom/other meeting creation is not wired yet. "
-                "Google Meet is the default once Google Calendar OAuth is configured."
+                f"I can help with the meeting, but this setup only supports "
+                f"{self.calendar.provider_name} right now, not {request.platform.replace('_', ' ')}."
             )
         if not request.is_ready:
             missing = ", ".join(request.missing_fields)
-            return f"I can set up a Google Meet, but I need the missing detail first: {missing}."
+            return f"I can set that up. I just still need one detail first: {missing}."
         if not self.calendar.is_configured():
             return (
-                "I can create the Google Meet, but Google Calendar OAuth is not configured in "
-                "this runtime yet. Add `config/google-oauth-client.json` and run "
-                "`digime google auth`, then ask me again. Calendar setup: the one thing even "
-                "bots cannot just import with vibes."
+                f"I can create the meeting through {self.calendar.provider_name}, but it is not "
+                "configured in this runtime yet."
             )
 
         try:
-            meeting = self.calendar.create_google_meet(request)
-        except GoogleCalendarError as error:
-            return f"I could not create the Google Meet yet: {error}"
+            meeting = self.calendar.create_meeting(request)
+        except CalendarProviderError as error:
+            return f"I tried to create the meeting, but it did not go through yet: {error}"
+        self.store.clear_meeting_state(channel_id)
 
-        return (
-            f"Google Meet is set for {meeting.start_iso}: {meeting.meeting_url} "
-            f"(calendar event: {meeting.event_url})"
-        )
+        meeting_name = "meeting"
+        if meeting.meeting_url:
+            meeting_name = "Google Meet" if request.platform == "google_meet" else "meeting"
+            return (
+                f"All set. I created the {meeting_name} for {meeting.start_iso}: "
+                f"{meeting.meeting_url} (calendar event: {meeting.event_url})"
+            )
+        return f"All set. I created the calendar event for {meeting.start_iso}: {meeting.event_url}"
 
     def _conversation_state(self, message: discord.Message) -> ConversationState:
         records = self.store.recent_discord_messages(
@@ -244,13 +290,13 @@ class DigiMeDiscordClient(discord.Client):
     def _handle_deterministic_reply(self, state: ConversationState) -> str | None:
         if state.intent == "weather_request":
             return (
-                "I cannot check live weather from this local runtime yet. "
-                "If you want, ask me again after wiring a weather data source."
+                "I can't check live weather from this runtime yet. If you want, I can help wire "
+                "in a weather source next."
             )
         if state.intent == "greeting":
-            return f"Hey {state.latest_author_name}, I am here. What do you need?"
+            return f"Hey {state.latest_author_name} - I'm here. What do you need?"
         if state.intent == "thanks":
-            return "Any time."
+            return "Of course."
         if state.intent in {"acknowledgement", "statement"}:
             return None
         if state.confidence == "low":
@@ -261,22 +307,40 @@ class DigiMeDiscordClient(discord.Client):
         self,
         channel: discord.abc.Messageable,
         content: str,
+        *,
+        state: ConversationState | None = None,
+        source_message_id: str | None = None,
     ) -> None:
         sent_message = await channel.send(content)
         self.store.upsert_discord_message(self._discord_message_from_gateway(sent_message))
+        if state is not None and source_message_id is not None:
+            self.store.save_reply_example(
+                platform="discord",
+                conversation_id=str(sent_message.channel.id),
+                incoming_context=_reply_example_context(state),
+                your_reply=content,
+                sent_at=sent_message.created_at.isoformat(),
+                source_message_id=source_message_id,
+            )
 
     async def _send_proposed_reply(
         self,
         message: discord.Message,
         proposed_reply: str,
         reason: str,
+        state: ConversationState,
     ) -> bool:
         print(
             f"\nProposed {reason} for {message.author.display_name}:\n"
             f"{message.content}\n\n{proposed_reply}\n"
         )
         if self.config.auto_send:
-            await self._send_and_store(message.channel, proposed_reply)
+            await self._send_and_store(
+                message.channel,
+                proposed_reply,
+                state=state,
+                source_message_id=str(message.id),
+            )
             return True
 
         approved_reply = await asyncio.to_thread(
@@ -287,9 +351,26 @@ class DigiMeDiscordClient(discord.Client):
             ),
         )
         if approved_reply:
-            await self._send_and_store(message.channel, approved_reply)
+            await self._send_and_store(
+                message.channel,
+                approved_reply,
+                state=state,
+                source_message_id=str(message.id),
+            )
             return True
         return False
+
+    def _retrieved_examples_block(self, state: ConversationState, channel_id: str) -> str | None:
+        query_text = "\n".join(turn.content for turn in state.relevant_turns)
+        matches = self.store.find_similar_reply_examples(
+            platform="discord",
+            conversation_id=channel_id,
+            query_text=query_text,
+            limit=3,
+        )
+        if not matches:
+            return None
+        return _format_reply_examples(matches)
 
     def _discord_message_from_gateway(self, message: discord.Message) -> DiscordMessage:
         return DiscordMessage(
@@ -343,3 +424,20 @@ def _select_auto_reply(drafts: list[object]) -> str:
     if drafts:
         return str(getattr(drafts[0], "text"))
     return "Got it."
+
+
+def _reply_example_context(state: ConversationState) -> str:
+    return "\n".join(
+        f"{turn.author_name}: {turn.content}"
+        for turn in state.relevant_turns
+        if not turn.is_bot
+    )
+
+
+def _format_reply_examples(matches: list[ReplyExampleMatch]) -> str:
+    lines: list[str] = []
+    for index, match in enumerate(matches, start=1):
+        lines.append(f"Example {index}:")
+        lines.append(f"Incoming context: {match.incoming_context}")
+        lines.append(f"Approved reply: {match.your_reply}")
+    return "\n".join(lines)

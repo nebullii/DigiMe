@@ -18,6 +18,8 @@ class Settings(BaseSettings):
         None,
         validation_alias="DISCORD_DEFAULT_CHANNEL_ID",
     )
+    discord_channel_ids_raw: str | None = Field(None, validation_alias="DISCORD_CHANNEL_IDS")
+    calendar_provider: str = Field("google", validation_alias="DIGIME_CALENDAR_PROVIDER")
     google_calendar_id: str = Field("primary", validation_alias="GOOGLE_CALENDAR_ID")
     google_oauth_client_file: str = Field(
         "./config/google-oauth-client.json",
@@ -29,11 +31,24 @@ class Settings(BaseSettings):
     )
     timezone: str = Field("America/New_York", validation_alias="DIGIME_TIMEZONE")
 
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore", populate_by_name=True)
 
     @property
     def slack_token(self) -> str | None:
         return self.slack_user_token or self.slack_bot_token
+
+    @property
+    def discord_channel_ids(self) -> list[str]:
+        configured: list[str] = []
+        if self.discord_channel_ids_raw:
+            configured.extend(
+                item.strip()
+                for item in self.discord_channel_ids_raw.split(",")
+                if item.strip()
+            )
+        if self.discord_default_channel_id and self.discord_default_channel_id not in configured:
+            configured.append(self.discord_default_channel_id)
+        return configured
 
 
 settings = Settings()

@@ -1,28 +1,26 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 from uuid import uuid4
 
 from digime.agent.meeting import MeetingRequest
+from digime.connectors.calendar_provider import (
+    CalendarProviderError,
+    CreatedMeeting,
+)
 
 
 SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
 
 
-class GoogleCalendarError(RuntimeError):
+class GoogleCalendarError(CalendarProviderError):
     pass
 
 
-@dataclass(frozen=True)
-class CreatedMeeting:
-    event_url: str
-    meeting_url: str
-    start_iso: str
+class GoogleCalendarProvider:
+    provider_name = "google"
 
-
-class GoogleCalendarConnector:
     def __init__(
         self,
         credentials_path: str,
@@ -36,7 +34,10 @@ class GoogleCalendarConnector:
     def is_configured(self) -> bool:
         return self.credentials_path.exists()
 
-    def create_google_meet(self, request: MeetingRequest) -> CreatedMeeting:
+    def supports_meeting_platform(self, platform: str) -> bool:
+        return platform == "google_meet"
+
+    def create_meeting(self, request: MeetingRequest) -> CreatedMeeting:
         if request.start is None:
             raise GoogleCalendarError("Meeting request is missing a start time.")
         if not self.credentials_path.exists():
@@ -79,6 +80,7 @@ class GoogleCalendarConnector:
         if not meeting_url:
             raise GoogleCalendarError("Google Calendar did not return a Meet link.")
         return CreatedMeeting(
+            provider=self.provider_name,
             event_url=event.get("htmlLink", ""),
             meeting_url=meeting_url,
             start_iso=request.start.isoformat(),
@@ -117,3 +119,6 @@ def _conference_uri(event: dict) -> str | None:
         if entry_point.get("entryPointType") == "video":
             return entry_point.get("uri")
     return None
+
+
+GoogleCalendarConnector = GoogleCalendarProvider
