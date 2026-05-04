@@ -86,10 +86,11 @@ Future providers such as Outlook or CalDAV should plug into the same action laye
 
 Required Google setup:
 
-1. Create an OAuth client in Google Cloud Console.
-2. Enable Google Calendar API.
-3. Download the OAuth client JSON.
-4. Save it locally as:
+1. Go to Google Cloud > Search for Google Calendar API > Enable Google Calendar API.
+2. Once enabled, click on Credentials > Create Credentials > Create OAuth client ID > Application Type (Desktop App) Permissions
+3. Create an OAuth client in Google Cloud Console.
+4. Download the OAuth client JSON.
+5. Save it locally as:
 
 ```text
 config/google-oauth-client.json
